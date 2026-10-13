@@ -8,7 +8,6 @@ import {
   movePathWithCopyFallback,
   type MovePathPublicationReceipt,
 } from "@openclaw/fs-safe/atomic";
-import { isRecord as isObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { runCommandWithTimeout } from "../process/exec.js";
 import { hasErrnoCode } from "./errno.js";
 import { isRemovalIoError, removePathWithinRoot } from "./fs-safe-remove.js";
