@@ -14,10 +14,14 @@ import { hasErrnoCode } from "./errno.js";
 import { isRemovalIoError, removePathWithinRoot } from "./fs-safe-remove.js";
 import { FsSafeError, pathExists } from "./fs-safe.js";
 import { resolveInstallWorkTimeoutMs } from "./install-mode-options.js";
+import {
+  hideProjectNpmConfigForInstall,
+  restoreProjectNpmConfigAfterInstall,
+  sanitizeManifestForNpmInstall,
+} from "./install-package-dir-staging.js";
 import { withInstallActivity, type InstallActivityObserver } from "./install-progress.js";
 import { assertCanonicalPathWithinBase } from "./install-safe-path.js";
 import { formatNpmCommandFailureOutput } from "./install-source-utils.js";
-import { tryReadJson, writeJson } from "./json-files.js";
 import { retainMutationAuthority } from "./mutation-authority.js";
 import { resolveNpmCommand } from "./npm-command.js";
 import { createSafeNpmInstallArgs, createSafeNpmInstallEnv } from "./safe-package-install.js";
@@ -29,15 +33,6 @@ const INSTALL_BASE_CHANGED_ABORT_WARNING =
   "Install base directory changed during install; aborting staged publish.";
 const INSTALL_BASE_CHANGED_BACKUP_WARNING =
   "Install base directory changed before backup cleanup; leaving backup in place.";
-const STAGED_NPM_PROJECT_CONFIG_NAME = ".npmrc";
-const STAGED_NPM_PROJECT_CONFIG_PREFIX = ".openclaw-install-hidden-npmrc-";
-
-type HiddenProjectConfigFile = {
-  hiddenDir: string;
-  originalPath: string;
-  hiddenPath: string;
-} | null;
-
 type InstallPackageDirFailure = { ok: false; error: string };
 type InstallPackageDirSuccess = { ok: true };
 
@@ -51,97 +46,20 @@ export function hasPackageRuntimeDependencies(manifest: {
   );
 }
 
-async function sanitizeManifestForNpmInstall(
-  targetDir: string,
-  omitOpenClawHostDependency: boolean,
-): Promise<() => Promise<void>> {
-  const manifestPath = path.join(targetDir, "package.json");
-  const parsed = await tryReadJson<unknown>(manifestPath);
-  if (!isObjectRecord(parsed)) {
-    return () => Promise.resolve();
-  }
-  const manifest = parsed;
-  const originalManifest = await fs.readFile(manifestPath);
-  let changed = false;
-
-  // npm resolves omitted development dependencies even when it does not install them.
-  if (Object.hasOwn(manifest, "devDependencies")) {
-    delete manifest.devDependencies;
-    changed = true;
-  }
-
-  if (omitOpenClawHostDependency) {
-    for (const key of [
-      "dependencies",
-      "optionalDependencies",
-      "peerDependencies",
-      "peerDependenciesMeta",
-    ] as const) {
-      const dependencies = manifest[key];
-      if (!isObjectRecord(dependencies) || !Object.hasOwn(dependencies, "openclaw")) {
-        continue;
-      }
-      delete dependencies.openclaw;
-      if (Object.keys(dependencies).length === 0) {
-        delete manifest[key];
-      }
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    await writeJson(manifestPath, manifest, { trailingNewline: true });
-    return async () => {
-      await fs.writeFile(manifestPath, originalManifest);
-    };
-  }
-  return () => Promise.resolve();
-}
-
-async function hideProjectNpmConfigForInstall(targetDir: string): Promise<HiddenProjectConfigFile> {
-  const originalPath = path.join(targetDir, STAGED_NPM_PROJECT_CONFIG_NAME);
-  let hiddenDir = "";
-  try {
-    hiddenDir = await fs.mkdtemp(path.join(targetDir, STAGED_NPM_PROJECT_CONFIG_PREFIX));
-    const hiddenPath = path.join(hiddenDir, STAGED_NPM_PROJECT_CONFIG_NAME);
-    await fs.rename(originalPath, hiddenPath);
-    return { hiddenDir, originalPath, hiddenPath };
-  } catch (error) {
-    if (hiddenDir) {
-      await fs.rm(hiddenDir, { recursive: true, force: true }).catch(() => undefined);
-    }
-    if (hasErrnoCode(error, "ENOENT")) {
-      return null;
-    }
-    throw error;
-  }
-}
-
-async function restoreProjectNpmConfigAfterInstall(
-  hiddenConfig: HiddenProjectConfigFile,
-): Promise<void> {
-  if (!hiddenConfig) {
-    return;
-  }
-  await fs.rename(hiddenConfig.hiddenPath, hiddenConfig.originalPath);
-  await fs.rm(hiddenConfig.hiddenDir, { recursive: true, force: true });
-}
-
 function isInstallBaseChangedError(error: unknown): boolean {
   return error instanceof Error && error.message === INSTALL_BASE_CHANGED_ERROR_MESSAGE;
 }
 
 function isHeldInstallError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code; // SAFETY: errno rides on fs move errors
   return code === "EBUSY" || code === "EPERM";
 }
 
 /**
- * Restore entries the copy fallback's sequential unlinks already removed from
- * the installed tree, copying each missing entry from the complete backup.
- * Held entries never left the installed tree and are not written. Returns
- * false without partial writes when any step fails, so the caller can keep
- * the backup as the recovery copy.
+ * Copy every backup entry missing from the installed tree back into it,
+ * restoring what sequential unlinks removed. Held entries never left the
+ * installed tree and are not written; any failure returns false so the caller
+ * keeps the backup as the recovery copy.
  */
 async function backfillMissingEntriesFromBackup(
   installedDir: string,
@@ -529,19 +447,16 @@ export async function installPackageDir<
           }
         }
         if (originalIdentityMatches) {
-          // Copy fallback unlinks source children sequentially, so a matching
-          // directory identity alone does not prove the original is complete:
-          // earlier unlocked children may already have been removed before a
-          // held one threw. Backfill those removed entries from the backup so
-          // the original tree is whole again and a retry is not blocked by a
-          // half-removed install; the held entry itself never left the target.
+          // Copy fallback unlinks children sequentially, so a held later child
+          // can leave the original partially removed with an intact identity.
+          // Backfill the removed entries from the complete backup so the tree
+          // is whole and a retry is not blocked; the held entry never left.
           const backfilled = await backfillMissingEntriesFromBackup(
             canonicalTargetDir,
             restoring.path,
           );
           if (backfilled) {
-            // The original install is complete again, so the backup copy is
-            // redundant whether displacement removed anything or not.
+            // The backup copy is redundant once the original is whole again.
             await removeInstallTree({
               directory: restoring.path,
               identity: restoring,
@@ -551,8 +466,7 @@ export async function installPackageDir<
               await fs.rmdir(backupsRootDir).catch(() => undefined);
             }
           } else {
-            // Backfill could not complete (for example another holder or a
-            // full disk). Keep the complete backup as the recovery copy.
+            // Backfill could not complete; keep the backup as the recovery copy.
             throw new Error(
               `original install partially removed at ${canonicalTargetDir} and could not be restored from ${restoring.path}; stop the holder and restore the backup manually`,
             );
