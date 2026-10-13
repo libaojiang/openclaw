@@ -131,6 +131,11 @@ function isInstallBaseChangedError(error: unknown): boolean {
   return error instanceof Error && error.message === INSTALL_BASE_CHANGED_ERROR_MESSAGE;
 }
 
+function isHeldInstallError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EBUSY" || code === "EPERM";
+}
+
 async function assertInstallBaseStable(params: {
   installBaseDir: string;
   expectedRealPath: string;
@@ -339,6 +344,8 @@ export async function installPackageDir<
     install: MovePathPublicationReceipt | null;
     restore: MovePathPublicationReceipt | null;
   } = { backup: null, install: null, restore: null };
+  let displacedTargetIdentity: Awaited<ReturnType<typeof readDirectoryIdentity>> | undefined;
+  let backupsRootDir: string | undefined;
   const sourceHardlinks = params.sourceHardlinks === "package-manager" ? "allow" : "reject";
   const assertInstallBase = () =>
     assertInstallBaseStable({ installBaseDir, expectedRealPath: installBaseRealPath });
@@ -461,24 +468,51 @@ export async function installPackageDir<
           },
         });
       } else {
-        await movePathWithCopyFallback({
-          assertBeforeRename: () => {
-            assertDirectoryIdentity(restoring.path, restoring);
-            if (fsSync.lstatSync(canonicalTargetDir, { throwIfNoEntry: false })) {
-              throw new Error(`install target changed during rollback: ${canonicalTargetDir}`);
-            }
-          },
-          assertBeforeMutation: () => {
-            assertDirectoryIdentity(restoring.path, restoring);
-            assertRollbackOwned();
-          },
-          onDestinationPublished: (receipt) => {
-            published.restore = receipt;
-          },
-          from: restoring.path,
-          sourceHardlinks,
-          to: canonicalTargetDir,
-        });
+        let originalIntact = false;
+        if (
+          displacedTargetIdentity &&
+          fsSync.lstatSync(canonicalTargetDir, { throwIfNoEntry: false })
+        ) {
+          try {
+            assertDirectoryIdentity(canonicalTargetDir, displacedTargetIdentity);
+            originalIntact = true;
+          } catch {
+            originalIntact = false;
+          }
+        }
+        if (originalIntact) {
+          // Displacement published the backup copy but could not remove the
+          // original tree (its files are held by another process), so the
+          // original install never left the target. Discard the redundant
+          // backup instead of failing to restore over the intact original.
+          await removeInstallTree({
+            directory: restoring.path,
+            identity: restoring,
+            assertOwner: assertRollbackOwned,
+          });
+          if (backupsRootDir) {
+            await fs.rmdir(backupsRootDir).catch(() => undefined);
+          }
+        } else {
+          await movePathWithCopyFallback({
+            assertBeforeRename: () => {
+              assertDirectoryIdentity(restoring.path, restoring);
+              if (fsSync.lstatSync(canonicalTargetDir, { throwIfNoEntry: false })) {
+                throw new Error(`install target changed during rollback: ${canonicalTargetDir}`);
+              }
+            },
+            assertBeforeMutation: () => {
+              assertDirectoryIdentity(restoring.path, restoring);
+              assertRollbackOwned();
+            },
+            onDestinationPublished: (receipt) => {
+              published.restore = receipt;
+            },
+            from: restoring.path,
+            sourceHardlinks,
+            to: canonicalTargetDir,
+          });
+        }
       }
       published.backup = null;
     } catch (error) {
@@ -600,6 +634,7 @@ export async function installPackageDir<
 
   if (params.mode === "update" && (await pathExists(canonicalTargetDir))) {
     const backupRoot = path.join(installBaseRealPath, ".openclaw-install-backups");
+    backupsRootDir = backupRoot;
     const backupPath = path.join(
       backupRoot,
       `${path.basename(canonicalTargetDir)}-${randomUUID()}`,
@@ -611,9 +646,16 @@ export async function installPackageDir<
         candidatePath: backupPath,
         boundaryLabel: "install directory",
       });
+      displacedTargetIdentity = await readDirectoryIdentity(canonicalTargetDir);
       await publish(canonicalTargetDir, backupPath, "backup");
     } catch (err) {
-      return await fail(`${params.copyErrorPrefix}: ${String(err)}`, err);
+      const held = isHeldInstallError(err);
+      return await fail(
+        held
+          ? `${params.copyErrorPrefix}: ${String(err)}. The current install's files are held by another process, usually a running Gateway; stop the Gateway and retry this update.`
+          : `${params.copyErrorPrefix}: ${String(err)}`,
+        err,
+      );
     }
   }
 

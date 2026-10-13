@@ -1,6 +1,7 @@
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { holdWindowsSharingLock } from "@openclaw/fs-safe/test-hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { withPluginLifecycleLease } from "../plugins/plugin-lifecycle-lease.js";
@@ -862,4 +863,43 @@ describe("installPackageDir", () => {
       closeOpenClawStateDatabaseForTest();
     }
   });
+
+  it.runIf(process.platform === "win32")(
+    "keeps the intact original and leaves no backup when a held file blocks displacement",
+    async () => {
+      await fixtureRootTracker.setup();
+      const fixtureRoot = await fixtureRootTracker.make("case");
+      const { installBaseDir, sourceDir, targetDir } =
+        await createExistingInstallFixture(fixtureRoot);
+      const installOptions = {
+        sourceDir,
+        targetDir,
+        mode: "update" as const,
+        timeoutMs: 1_000,
+        copyErrorPrefix: "failed to copy plugin",
+        hasDeps: false,
+        depsLogMessage: "unused",
+      };
+      const lock = holdWindowsSharingLock(path.join(targetDir, "marker.txt"));
+      let heldFailure: Awaited<ReturnType<typeof installPackageDir>>;
+      try {
+        heldFailure = await installPackageDir(installOptions);
+      } finally {
+        lock.close();
+      }
+
+      expect(heldFailure).toMatchObject({ ok: false });
+      expect(heldFailure.error).toContain("EBUSY");
+      expect(heldFailure.error).toContain("stop the Gateway and retry");
+      expect(heldFailure.error).not.toContain("could not restore existing install");
+      await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
+      await expect(
+        listMatchingDirs(installBaseDir, ".openclaw-install-backups"),
+      ).resolves.toHaveLength(0);
+
+      const retried = await installPackageDir(installOptions);
+      expect(retried).toEqual({ ok: true });
+      await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("new");
+    },
+  );
 });
