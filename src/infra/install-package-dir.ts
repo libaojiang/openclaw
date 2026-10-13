@@ -136,6 +136,54 @@ function isHeldInstallError(error: unknown): boolean {
   return code === "EBUSY" || code === "EPERM";
 }
 
+/**
+ * Restore entries the copy fallback's sequential unlinks already removed from
+ * the installed tree, copying each missing entry from the complete backup.
+ * Held entries never left the installed tree and are not written. Returns
+ * false without partial writes when any step fails, so the caller can keep
+ * the backup as the recovery copy.
+ */
+async function backfillMissingEntriesFromBackup(
+  installedDir: string,
+  backupDir: string,
+): Promise<boolean> {
+  const walk = async (relative: string): Promise<boolean> => {
+    const entries = await fs.readdir(path.join(backupDir, relative), {
+      withFileTypes: true,
+    });
+    for (const entry of entries) {
+      const entryRelative = path.join(relative, entry.name);
+      const installedPath = path.join(installedDir, entryRelative);
+      const backupPath = path.join(backupDir, entryRelative);
+      const installedStat = fsSync.lstatSync(installedPath, { throwIfNoEntry: false });
+      const backupStat = fsSync.lstatSync(backupPath, { throwIfNoEntry: false });
+      if (!backupStat) {
+        return false;
+      }
+      if (!installedStat) {
+        try {
+          await fs.cp(backupPath, installedPath, {
+            recursive: true,
+            force: false,
+            verbatimSymlinks: true,
+          });
+        } catch {
+          return false;
+        }
+        continue;
+      }
+      if (installedStat.isDirectory() !== backupStat.isDirectory()) {
+        return false;
+      }
+      if (entry.isDirectory() && !(await walk(entryRelative))) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return await walk("");
+}
+
 async function assertInstallBaseStable(params: {
   installBaseDir: string;
   expectedRealPath: string;
@@ -468,30 +516,46 @@ export async function installPackageDir<
           },
         });
       } else {
-        let originalIntact = false;
+        let originalIdentityMatches = false;
         if (
           displacedTargetIdentity &&
           fsSync.lstatSync(canonicalTargetDir, { throwIfNoEntry: false })
         ) {
           try {
             assertDirectoryIdentity(canonicalTargetDir, displacedTargetIdentity);
-            originalIntact = true;
+            originalIdentityMatches = true;
           } catch {
-            originalIntact = false;
+            originalIdentityMatches = false;
           }
         }
-        if (originalIntact) {
-          // Displacement published the backup copy but could not remove the
-          // original tree (its files are held by another process), so the
-          // original install never left the target. Discard the redundant
-          // backup instead of failing to restore over the intact original.
-          await removeInstallTree({
-            directory: restoring.path,
-            identity: restoring,
-            assertOwner: assertRollbackOwned,
-          });
-          if (backupsRootDir) {
-            await fs.rmdir(backupsRootDir).catch(() => undefined);
+        if (originalIdentityMatches) {
+          // Copy fallback unlinks source children sequentially, so a matching
+          // directory identity alone does not prove the original is complete:
+          // earlier unlocked children may already have been removed before a
+          // held one threw. Backfill those removed entries from the backup so
+          // the original tree is whole again and a retry is not blocked by a
+          // half-removed install; the held entry itself never left the target.
+          const backfilled = await backfillMissingEntriesFromBackup(
+            canonicalTargetDir,
+            restoring.path,
+          );
+          if (backfilled) {
+            // The original install is complete again, so the backup copy is
+            // redundant whether displacement removed anything or not.
+            await removeInstallTree({
+              directory: restoring.path,
+              identity: restoring,
+              assertOwner: assertRollbackOwned,
+            });
+            if (backupsRootDir) {
+              await fs.rmdir(backupsRootDir).catch(() => undefined);
+            }
+          } else {
+            // Backfill could not complete (for example another holder or a
+            // full disk). Keep the complete backup as the recovery copy.
+            throw new Error(
+              `original install partially removed at ${canonicalTargetDir} and could not be restored from ${restoring.path}; stop the holder and restore the backup manually`,
+            );
           }
         } else {
           await movePathWithCopyFallback({

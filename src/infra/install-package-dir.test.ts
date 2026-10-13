@@ -888,11 +888,62 @@ describe("installPackageDir", () => {
         lock.close();
       }
 
-      expect(heldFailure).toMatchObject({ ok: false });
+      if (!heldFailure || heldFailure.ok) {
+        throw new Error("expected the held-file update to fail");
+      }
       expect(heldFailure.error).toContain("EBUSY");
       expect(heldFailure.error).toContain("stop the Gateway and retry");
       expect(heldFailure.error).not.toContain("could not restore existing install");
       await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
+      await expect(
+        listMatchingDirs(installBaseDir, ".openclaw-install-backups"),
+      ).resolves.toHaveLength(0);
+
+      const retried = await installPackageDir(installOptions);
+      expect(retried).toEqual({ ok: true });
+      await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("new");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "restores the complete original from backup after partial removal hit a held later child",
+    async () => {
+      await fixtureRootTracker.setup();
+      const fixtureRoot = await fixtureRootTracker.make("case");
+      const { installBaseDir, sourceDir, targetDir } =
+        await createExistingInstallFixture(fixtureRoot);
+      await fs.writeFile(path.join(targetDir, "aaa-unlocked.txt"), "first");
+      await fs.writeFile(path.join(targetDir, "zzz-held.txt"), "last");
+      const installOptions = {
+        sourceDir,
+        targetDir,
+        mode: "update" as const,
+        timeoutMs: 1_000,
+        copyErrorPrefix: "failed to copy plugin",
+        hasDeps: false,
+        depsLogMessage: "unused",
+      };
+      const lock = holdWindowsSharingLock(path.join(targetDir, "zzz-held.txt"));
+      let heldFailure: Awaited<ReturnType<typeof installPackageDir>>;
+      try {
+        heldFailure = await installPackageDir(installOptions);
+      } finally {
+        lock.close();
+      }
+
+      if (!heldFailure || heldFailure.ok) {
+        throw new Error("expected the held-file update to fail");
+      }
+      expect(heldFailure.error).toContain("EBUSY");
+      expect(heldFailure.error).toContain("stop the Gateway and retry");
+      expect(heldFailure.error).not.toContain("could not restore existing install");
+      // Displacement removed the earlier children before the held one threw;
+      // rollback backfills them from the backup so the tree is whole again.
+      await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
+      await expect(fs.readFile(path.join(targetDir, "aaa-unlocked.txt"), "utf8")).resolves.toBe(
+        "first",
+      );
+      await expect(fs.readFile(path.join(targetDir, "zzz-held.txt"), "utf8")).resolves.toBe("last");
       await expect(
         listMatchingDirs(installBaseDir, ".openclaw-install-backups"),
       ).resolves.toHaveLength(0);
