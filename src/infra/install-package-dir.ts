@@ -9,7 +9,6 @@ import {
   type MovePathPublicationReceipt,
 } from "@openclaw/fs-safe/atomic";
 import { runCommandWithTimeout } from "../process/exec.js";
-import { hasErrnoCode } from "./errno.js";
 import { isRemovalIoError, removePathWithinRoot } from "./fs-safe-remove.js";
 import { FsSafeError, pathExists } from "./fs-safe.js";
 import { resolveInstallWorkTimeoutMs } from "./install-mode-options.js";
