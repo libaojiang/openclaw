@@ -80,23 +80,36 @@ async function backfillMissingEntriesFromBackup(params: {
         return false;
       }
       if (!installedStat) {
+        if (entry.isSymbolicLink()) {
+          // Read the target before asserting: authority must be checked
+          // immediately before the write, not before a pending read.
+          const target = await fs.readlink(backupPath);
+          params.assertCurrent();
+          try {
+            await fs.symlink(target, installedPath);
+          } catch {
+            return false;
+          }
+          continue;
+        }
         params.assertCurrent();
         try {
           if (entry.isDirectory()) {
             await fs.mkdir(installedPath);
-          } else if (entry.isSymbolicLink()) {
-            await fs.symlink(await fs.readlink(backupPath), installedPath);
           } else {
             await fs.copyFile(backupPath, installedPath);
           }
         } catch {
           return false;
         }
-        continue;
-      }
-      if (installedStat.isDirectory() !== backupStat.isDirectory()) {
+        if (!entry.isDirectory()) {
+          continue;
+        }
+      } else if (installedStat.isDirectory() !== backupStat.isDirectory()) {
         return false;
       }
+      // Newly recreated directories must recurse so their removed descendants
+      // are restored too, not just the empty directory shell.
       if (entry.isDirectory() && !(await walk(entryRelative))) {
         return false;
       }

@@ -1010,4 +1010,47 @@ describe("installPackageDir", () => {
       ).resolves.toHaveLength(1);
     },
   );
+
+  it.runIf(process.platform === "win32")(
+    "backfills nested directory contents removed before a held later child",
+    async () => {
+      await fixtureRootTracker.setup();
+      const fixtureRoot = await fixtureRootTracker.make("case");
+      const { installBaseDir, sourceDir, targetDir } =
+        await createExistingInstallFixture(fixtureRoot);
+      await fs.mkdir(path.join(targetDir, "aaa-dir"));
+      await fs.writeFile(path.join(targetDir, "aaa-dir", "index.js"), "nested");
+      await fs.writeFile(path.join(targetDir, "zzz-held.txt"), "last");
+      const installOptions = {
+        sourceDir,
+        targetDir,
+        mode: "update" as const,
+        timeoutMs: 1_000,
+        copyErrorPrefix: "failed to copy plugin",
+        hasDeps: false,
+        depsLogMessage: "unused",
+      };
+      const lock = holdWindowsSharingLock(path.join(targetDir, "zzz-held.txt"));
+      let heldFailure: Awaited<ReturnType<typeof installPackageDir>>;
+      try {
+        heldFailure = await installPackageDir(installOptions);
+      } finally {
+        lock.close();
+      }
+
+      if (!heldFailure || heldFailure.ok) {
+        throw new Error("expected the held-file update to fail");
+      }
+      expect(heldFailure.error).toContain("EBUSY");
+      // The removed directory is restored WITH its contents, not as an empty shell.
+      await expect(fs.readFile(path.join(targetDir, "aaa-dir", "index.js"), "utf8")).resolves.toBe(
+        "nested",
+      );
+      await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
+      await expect(fs.readFile(path.join(targetDir, "zzz-held.txt"), "utf8")).resolves.toBe("last");
+      await expect(
+        listMatchingDirs(installBaseDir, ".openclaw-install-backups"),
+      ).resolves.toHaveLength(0);
+    },
+  );
 });
