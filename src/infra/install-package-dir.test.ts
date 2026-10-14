@@ -953,4 +953,61 @@ describe("installPackageDir", () => {
       await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("new");
     },
   );
+
+  it.runIf(process.platform === "win32")(
+    "rejects backfill with zero writes when recovery ownership closes after partial removal",
+    async () => {
+      await fixtureRootTracker.setup();
+      const fixtureRoot = await fixtureRootTracker.make("case");
+      const { installBaseDir, sourceDir, targetDir } =
+        await createExistingInstallFixture(fixtureRoot);
+      await fs.writeFile(path.join(targetDir, "aaa-unlocked.txt"), "first");
+      await fs.writeFile(path.join(targetDir, "zzz-held.txt"), "last");
+      const installOptions = {
+        sourceDir,
+        targetDir,
+        mode: "update" as const,
+        timeoutMs: 1_000,
+        copyErrorPrefix: "failed to copy plugin",
+        hasDeps: false,
+        depsLogMessage: "unused",
+      };
+      const assertOwned = () => {
+        // Revoke recovery ownership once displacement has partially removed
+        // the install, right before rollback would backfill from the backup.
+        if (!fsSync.existsSync(path.join(targetDir, "marker.txt"))) {
+          throw new Error("lifecycle ownership closed");
+        }
+      };
+      const lock = holdWindowsSharingLock(path.join(targetDir, "zzz-held.txt"));
+      let refused: Awaited<ReturnType<typeof installPackageDir>>;
+      try {
+        refused = await installPackageDir(
+          copyPackageDirInstallTransactionRequest(
+            requestDeferredPackageDirInstall({}, assertOwned),
+            installOptions,
+          ),
+        );
+      } finally {
+        lock.close();
+      }
+
+      if (!refused || refused.ok) {
+        throw new Error("expected the held-file update to fail");
+      }
+      expect(refused.error).toContain("lifecycle ownership closed");
+      expect(refused.error).toContain("backup retained at");
+      // Zero backfill writes: the entries displacement removed stay missing.
+      await expect(fs.access(path.join(targetDir, "marker.txt"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(fs.access(path.join(targetDir, "aaa-unlocked.txt"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(fs.readFile(path.join(targetDir, "zzz-held.txt"), "utf8")).resolves.toBe("last");
+      await expect(
+        listMatchingDirs(installBaseDir, ".openclaw-install-backups"),
+      ).resolves.toHaveLength(1);
+    },
+  );
 });

@@ -54,35 +54,41 @@ function isHeldInstallError(error: unknown): boolean {
 }
 
 /**
- * Copy every backup entry missing from the installed tree back into it,
- * restoring what sequential unlinks removed. Held entries never left the
- * installed tree and are not written; any failure returns false so the caller
- * keeps the backup as the recovery copy.
+ * Restore backup entries missing from the installed tree, one write at a
+ * time: each mkdir, copy, or symlink runs only after the caller's recovery
+ * authority and identity assertion passes, so a refused or expired owner
+ * never reaches a filesystem write. Held entries never left the installed
+ * tree and are not written; any refused assertion propagates and any other
+ * failure returns false so the caller keeps the backup.
  */
-async function backfillMissingEntriesFromBackup(
-  installedDir: string,
-  backupDir: string,
-): Promise<boolean> {
+async function backfillMissingEntriesFromBackup(params: {
+  installedDir: string;
+  backupDir: string;
+  assertCurrent: () => void;
+}): Promise<boolean> {
   const walk = async (relative: string): Promise<boolean> => {
-    const entries = await fs.readdir(path.join(backupDir, relative), {
+    const entries = await fs.readdir(path.join(params.backupDir, relative), {
       withFileTypes: true,
     });
     for (const entry of entries) {
       const entryRelative = path.join(relative, entry.name);
-      const installedPath = path.join(installedDir, entryRelative);
-      const backupPath = path.join(backupDir, entryRelative);
+      const installedPath = path.join(params.installedDir, entryRelative);
+      const backupPath = path.join(params.backupDir, entryRelative);
       const installedStat = fsSync.lstatSync(installedPath, { throwIfNoEntry: false });
       const backupStat = fsSync.lstatSync(backupPath, { throwIfNoEntry: false });
       if (!backupStat) {
         return false;
       }
       if (!installedStat) {
+        params.assertCurrent();
         try {
-          await fs.cp(backupPath, installedPath, {
-            recursive: true,
-            force: false,
-            verbatimSymlinks: true,
-          });
+          if (entry.isDirectory()) {
+            await fs.mkdir(installedPath);
+          } else if (entry.isSymbolicLink()) {
+            await fs.symlink(await fs.readlink(backupPath), installedPath);
+          } else {
+            await fs.copyFile(backupPath, installedPath);
+          }
         } catch {
           return false;
         }
@@ -449,10 +455,20 @@ export async function installPackageDir<
           // can leave the original partially removed with an intact identity.
           // Backfill the removed entries from the complete backup so the tree
           // is whole and a retry is not blocked; the held entry never left.
-          const backfilled = await backfillMissingEntriesFromBackup(
-            canonicalTargetDir,
-            restoring.path,
-          );
+          // Every write re-asserts recovery ownership plus backup, base, and
+          // target identities, so a refused owner cannot restore files.
+          const assertBackfillCurrent = retainMutationAuthority(() => {
+            assertRollbackOwned();
+            assertDirectoryIdentity(restoring.path, restoring);
+            if (fsSync.lstatSync(canonicalTargetDir, { throwIfNoEntry: false })) {
+              assertDirectoryIdentity(canonicalTargetDir, displacedTargetIdentity!);
+            }
+          });
+          const backfilled = await backfillMissingEntriesFromBackup({
+            installedDir: canonicalTargetDir,
+            backupDir: restoring.path,
+            assertCurrent: assertBackfillCurrent,
+          });
           if (backfilled) {
             // The backup copy is redundant once the original is whole again.
             await removeInstallTree({
